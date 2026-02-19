@@ -7,6 +7,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
+import json
 import urllib3
 from playwright.sync_api import sync_playwright
 import re
@@ -23,7 +24,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
@@ -34,46 +35,61 @@ HEADERS = {
 
 
 def get_us_lotteries():
-    """Fetch Powerball and Mega Millions jackpots"""
+    """Fetch Powerball and Mega Millions jackpots from official sources"""
     results = {"Powerball": None, "Mega Millions": None}
     
-    # Powerball
+    # Powerball — scrape powerball.com (static HTML)
     try:
-        resp = requests.get("https://www.lotto.net/powerball", timeout=10, verify=False, headers=HEADERS)
+        resp = requests.get("https://www.powerball.com/", timeout=15, headers=HEADERS)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         all_text = soup.get_text()
         lines = all_text.split('\n')
         for i, line in enumerate(lines):
-            if 'Next Jackpot' in line and i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if '$' in next_line and 'Million' in next_line:
-                    # Extract numeric value
-                    match = re.search(r'\$(\d+(?:,\d+)?(?:\.\d+)?)', next_line)
-                    if match:
-                        value = float(match.group(1).replace(',', ''))
-                        results["Powerball"] = value * 1_000_000
+            if 'Estimated Jackpot' in line.strip():
+                # Dollar amount may be a few lines below (skip blanks)
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    next_line = lines[j].strip()
+                    if not next_line:
+                        continue
+                    if '$' in next_line:
+                        match = re.search(
+                            r'\$([\d,.]+)\s*(Billion|Million)',
+                            next_line,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            value = float(match.group(1).replace(',', ''))
+                            unit = match.group(2).lower()
+                            if unit == 'billion':
+                                results["Powerball"] = value * 1_000_000_000
+                            else:
+                                results["Powerball"] = value * 1_000_000
                     break
+                break
     except Exception as e:
         print(f"Error fetching Powerball: {e}")
     
-    # Mega Millions
+    # Mega Millions — official JSON API
     try:
-        resp = requests.get("https://www.lotto.net/mega-millions", timeout=10, verify=False, headers=HEADERS)
+        resp = requests.get(
+            "https://www.megamillions.com/cmspages/utilservice.asmx/GetLatestDrawData",
+            timeout=15,
+            headers=HEADERS,
+        )
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        all_text = soup.get_text()
-        lines = all_text.split('\n')
-        for i, line in enumerate(lines):
-            if 'Next Jackpot' in line and i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if '$' in next_line and 'Million' in next_line:
-                    # Extract numeric value
-                    match = re.search(r'\$(\d+(?:,\d+)?(?:\.\d+)?)', next_line)
-                    if match:
-                        value = float(match.group(1).replace(',', ''))
-                        results["Mega Millions"] = value * 1_000_000
-                    break
+        # Response is XML-wrapped JSON
+        match = re.search(r'\{.*\}', resp.text, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            jackpot = data.get("Jackpot", {})
+            next_pool = jackpot.get("NextPrizePool")
+            if next_pool is not None:
+                results["Mega Millions"] = float(next_pool)
+            else:
+                current = jackpot.get("CurrentPrizePool")
+                if current is not None:
+                    results["Mega Millions"] = float(current)
     except Exception as e:
         print(f"Error fetching Mega Millions: {e}")
     
